@@ -39,6 +39,7 @@ import akka.actor.typed.DispatcherSelector
 import scala.concurrent.ExecutionContext
 import scala.util.Success
 import scala.util.Failure
+import akka.stream.IOResult
 
 object S3Uploader extends App {
 
@@ -64,8 +65,6 @@ object S3Uploader extends App {
   val secretAccess = awsConfig.getString("secret-access-key ")
   val region = awsConfig.getString("region")
   val bucket = awsConfig.getString("bucket")
-
-  val bucketKey = "testfile.csv"
 
   val awsRegionProvider: AwsRegionProvider = () => Region.of(region)
 
@@ -98,8 +97,10 @@ object S3Uploader extends App {
       .map(r => ModifiedRecord(r.toString(), Instant.now()))
       .map(mr => ByteString(s"${mr.toCSV}"))
 
-  val awsSink: Sink[ByteString, Future[MultipartUploadResult]] =
-    S3.multipartUpload(bucket, bucketKey, ContentTypes.`text/csv(UTF-8)`)
+  def awsSink(
+      fileName: String
+  ): Sink[ByteString, Future[MultipartUploadResult]] =
+    S3.multipartUpload(bucket, fileName, ContentTypes.`text/csv(UTF-8)`)
       .withAttributes(S3Attributes.settings(s3Settings))
 
   val (actorRef, source) = actorSource.preMaterialize()
@@ -124,15 +125,21 @@ object S3Uploader extends App {
     actorRef ! Record(i)
   }
 
+  // Nr of records to group in each file
+  val n = 3
+
   actorRef ! Complete
 
-  val stream = source.via(flow).toMat(awsSink)(Keep.right)
+  val s3MultiFlow: Flow[Seq[ByteString], MultipartUploadResult, NotUsed] =
+    Flow[Seq[ByteString]].mapAsync(parallelism = 4) { bs =>
+      Source
+        .fromIterator(() => bs.iterator)
+        .runWith(awsSink(s"testfile_${Instant.now().toString()}"))
+    }
 
-  val doneF: Future[MultipartUploadResult] = stream.run()
+  val stream =
+    source.via(flow).grouped(n).via(s3MultiFlow).to(Sink.foreach(println))
 
-  doneF.onComplete {
-    case Success(part) => println(part)
-    case Failure(e)    => println(s"Stream failed with $e")
-  }
+  stream.run()
 
 }
