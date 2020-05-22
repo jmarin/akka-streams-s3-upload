@@ -81,7 +81,7 @@ object S3Uploader extends App {
   val actorSource: Source[Protocol, ActorRef[Protocol]] =
     ActorSource.actorRef[Protocol](
       completionMatcher = {
-        case Complete =>
+        case Complete => CompletionStrategy.immediately
       },
       failureMatcher = {
         case Fail(ex) => ex
