@@ -33,7 +33,7 @@ import akka.actor.typed.ActorRef
 import akka.stream.FlowShape
 import akka.actor.typed.javadsl.Behaviors
 
-object S3Uploader {
+object S3Uploader extends App {
 
   sealed trait Protocol
   case class Record(i: Int) extends Protocol
@@ -85,22 +85,19 @@ object S3Uploader {
     S3.multipartUpload(bucket, bucketKey, ContentTypes.`text/csv(UTF-8)`)
       .withAttributes(S3Attributes.settings(s3Settings))
 
-  def main(args: Array[String]): Unit = {
+  val g = RunnableGraph.fromGraph(GraphDSL.create() { implicit b =>
+    import GraphDSL.Implicits._
 
-    val g = RunnableGraph.fromGraph(GraphDSL.create() { implicit b =>
-      import GraphDSL.Implicits._
+    val aws = b.add(awsFlow)
+    val broadcast = b.add(Broadcast[Record](2))
+    val print = b.add(printSink)
 
-      val aws = b.add(awsFlow)
-      val broadcast = b.add(Broadcast[Record](2))
-      val print = b.add(printSink)
+    source ~> broadcast ~> print
+    broadcast ~> aws ~> awsSink
 
-      source ~> broadcast ~> print
-      broadcast ~> aws ~> awsSink
+    ClosedShape
+  })
 
-      ClosedShape
-    })
-
-    g.run()
-  }
+  g.run()
 
 }
