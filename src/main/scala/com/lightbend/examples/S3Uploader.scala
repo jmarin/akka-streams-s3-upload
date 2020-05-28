@@ -1,47 +1,40 @@
 package com.lightbend.examples
 
-import akka.stream.scaladsl.RunnableGraph
-import akka.stream.scaladsl.GraphDSL
-import akka.stream.scaladsl.Broadcast
-import akka.stream.scaladsl.{Source, Flow, Sink}
-import akka.Done
-import akka.stream.CompletionStrategy
-import akka.stream.OverflowStrategy
-import akka.stream.ClosedShape
 import akka.NotUsed
-import akka.util.ByteString
-import scala.concurrent.Future
-import akka.stream.alpakka.s3.MultipartUploadResult
-import akka.stream.alpakka.s3.scaladsl.S3
-import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials
-import com.typesafe.config.ConfigFactory
-import akka.stream.ActorMaterializer
+import akka.actor.typed.scaladsl.Behaviors
+import akka.actor.typed.Behavior
+import akka.actor.typed.Terminated
 import akka.actor.typed.ActorSystem
-import akka.actor.typed.scaladsl.adapter._
-import akka.stream.alpakka.s3.ObjectMetadata
-import akka.stream.alpakka.s3.S3Settings
-import akka.stream.alpakka.s3.impl.MemoryBuffer
-import akka.stream.alpakka.s3.MemoryBufferType
+import java.time.Instant
+import com.typesafe.config.ConfigFactory
 import software.amazon.awssdk.regions.providers.AwsRegionProvider
 import software.amazon.awssdk.regions.Region
-import akka.stream.alpakka.s3.S3Attributes
-import akka.http.scaladsl.model.ContentTypes
-import java.time.Instant
-import akka.stream.typed.scaladsl.ActorSource
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials
+import akka.stream.alpakka.s3.S3Settings
+import akka.stream.alpakka.s3.MemoryBufferType
+import akka.actor.typed.scaladsl.adapter._
 import akka.actor.typed.ActorRef
+import akka.stream.typed.scaladsl.ActorSource
+import akka.stream.CompletionStrategy
+import akka.stream.scaladsl.Source
+import akka.stream.scaladsl.Sink
+import scala.concurrent.Future
+import akka.Done
+import akka.stream.scaladsl.Flow
+import akka.util.ByteString
+import akka.stream.alpakka.s3.MultipartUploadResult
+import akka.http.scaladsl.model.ContentTypes
+import akka.stream.alpakka.s3.S3Attributes
+import akka.stream.alpakka.s3.scaladsl.S3
+import akka.stream.ActorMaterializer
+import akka.stream.scaladsl.GraphDSL
+import akka.stream.scaladsl.Broadcast
 import akka.stream.FlowShape
-import akka.actor.typed.javadsl.Behaviors
-import java.nio.file.Paths
-import akka.stream.scaladsl.FileIO
-import akka.stream.scaladsl.Keep
-import akka.actor.typed.DispatcherSelector
-import scala.concurrent.ExecutionContext
-import scala.util.Success
-import scala.util.Failure
-import akka.stream.IOResult
+import akka.stream.Materializer
+import akka.stream.OverflowStrategy
 
-object S3Uploader extends App {
+object S3Uploader2 {
 
   sealed trait Protocol
   case class Record(i: Int) extends Protocol
@@ -52,17 +45,10 @@ object S3Uploader extends App {
     def toCSV: String = s"${id};${date.toString()}\n"
   }
 
-  implicit val system: ActorSystem[_] =
-    ActorSystem(Behaviors.empty, "records")
-  implicit val ec: ExecutionContext =
-    system.dispatchers.lookup(DispatcherSelector.default())
-  implicit val classicSystem = system.toClassic
-  implicit val mat = ActorMaterializer()
-
   val awsConfig =
     ConfigFactory.load("application.conf").getConfig("aws")
   val accessKeyId = awsConfig.getString("access-key-id")
-  val secretAccess = awsConfig.getString("secret-access-key ")
+  val secretAccess = awsConfig.getString("secret-access-key")
   val region = awsConfig.getString("region")
   val bucket = awsConfig.getString("bucket")
 
@@ -72,22 +58,12 @@ object S3Uploader extends App {
     AwsBasicCredentials.create(accessKeyId, secretAccess)
   )
 
-  val s3Settings = S3Settings(classicSystem)
-    .withBufferType(MemoryBufferType)
-    .withCredentialsProvider(awsCredentialsProvider)
-    .withS3RegionProvider(awsRegionProvider)
-
-  val actorSource: Source[Protocol, ActorRef[Protocol]] =
-    ActorSource.actorRef[Protocol](
-      completionMatcher = {
-        case Complete => CompletionStrategy.immediately
-      },
-      failureMatcher = {
-        case Fail(ex) => ex
-      },
-      bufferSize = 100,
-      overflowStrategy = OverflowStrategy.dropHead
-    )
+  def s3Settings(classicSystem: akka.actor.ActorSystem) = {
+    S3Settings(classicSystem)
+      .withBufferType(MemoryBufferType)
+      .withCredentialsProvider(awsCredentialsProvider)
+      .withS3RegionProvider(awsRegionProvider)
+  }
 
   val printSink: Sink[Protocol, Future[Done]] =
     Sink.foreach[Protocol](r => println(s"Processed:$r"))
@@ -98,12 +74,11 @@ object S3Uploader extends App {
       .map(mr => ByteString(s"${mr.toCSV}"))
 
   def awsSink(
+      s3Settings: S3Settings,
       fileName: String
   ): Sink[ByteString, Future[MultipartUploadResult]] =
     S3.multipartUpload(bucket, fileName, ContentTypes.`text/csv(UTF-8)`)
       .withAttributes(S3Attributes.settings(s3Settings))
-
-  val (actorRef, source) = actorSource.preMaterialize()
 
   val flow: Flow[Protocol, ByteString, NotUsed] =
     Flow.fromGraph(GraphDSL.create() { implicit b =>
@@ -121,25 +96,68 @@ object S3Uploader extends App {
 
     })
 
-  for (i <- 1 to 10) {
-    actorRef ! Record(i)
-  }
-
-  // Nr of records to group in each file
-  val n = 3
-
-  actorRef ! Complete
-
-  val s3MultiFlow: Flow[Seq[ByteString], MultipartUploadResult, NotUsed] =
+  def s3MultiFlow(
+      s3Settings: S3Settings
+  )(
+      implicit mat: Materializer
+  ): Flow[Seq[ByteString], MultipartUploadResult, NotUsed] =
     Flow[Seq[ByteString]].mapAsync(parallelism = 4) { bs =>
       Source
         .fromIterator(() => bs.iterator)
-        .runWith(awsSink(s"testfile_${Instant.now().toString()}"))
+        .runWith(awsSink(s3Settings, s"testfile_${Instant.now().toString()}"))
     }
 
-  val stream =
-    source.via(flow).grouped(n).via(s3MultiFlow).to(Sink.foreach(println))
+  def main(args: Array[String]): Unit = {
+    ActorSystem(S3Uploader2(), "s3UploadDemo")
+  }
 
-  stream.run()
+  def apply(): Behavior[NotUsed] =
+    Behaviors.setup { context =>
+      implicit val classicSystem = context.system.toClassic
+      implicit val mat = ActorMaterializer()
+
+      val s3Config = s3Settings(classicSystem)
+
+      val actorSource: Source[Protocol, ActorRef[Protocol]] =
+        ActorSource.actorRef[Protocol](
+          completionMatcher = {
+            case Complete => CompletionStrategy.immediately
+          },
+          failureMatcher = {
+            case Fail(ex) => ex
+          },
+          bufferSize = 5,
+          overflowStrategy = OverflowStrategy.dropHead
+        )
+
+      val (actorRef, source) = actorSource.preMaterialize()
+
+      val range = for (i <- 1 to 10) yield i
+      val messages = range.map(i => Record(i))
+
+      for (i <- 1 to 10) {
+        actorRef ! Record(i)
+      }
+
+      // Nr of records to group in each file
+      val n = 3
+
+      actorRef ! Complete
+
+      val stream =
+        source
+          .via(flow)
+          .grouped(n)
+          .via(s3MultiFlow(s3Config))
+          .to(Sink.foreach(println))
+
+      stream.run()
+
+      Behaviors.receiveSignal {
+        case (_, Terminated(_)) =>
+          Behaviors.stopped
+      }
+
+    }
 
 }
