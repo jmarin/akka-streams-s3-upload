@@ -33,10 +33,18 @@ import akka.stream.scaladsl.Broadcast
 import akka.stream.FlowShape
 import akka.stream.Materializer
 import akka.stream.OverflowStrategy
+import akka.stream.IOResult
+import akka.stream.scaladsl.FileIO
+import java.nio.file.Paths
+import akka.actor.Status.Success
 
-object S3Uploader2 {
+object S3Uploader {
+
+  trait Ack
+  case object Ack
 
   sealed trait Protocol
+  case object Start extends Protocol
   case class Record(i: Int) extends Protocol
   case object Complete extends Protocol
   case class Fail(ex: Exception) extends Protocol
@@ -70,6 +78,7 @@ object S3Uploader2 {
 
   val awsFlow: Flow[Protocol, ByteString, NotUsed] =
     Flow[Protocol]
+      .filter(m => m != Start)
       .map(r => ModifiedRecord(r.toString(), Instant.now()))
       .map(mr => ByteString(s"${mr.toCSV}"))
 
@@ -107,11 +116,23 @@ object S3Uploader2 {
         .runWith(awsSink(s3Settings, s"testfile_${Instant.now().toString()}"))
     }
 
+  def fileFlow(
+      fileName: String
+  )(implicit mat: Materializer): Flow[Seq[ByteString], IOResult, NotUsed] =
+    Flow[Seq[ByteString]].mapAsync(parallelism = 4) { bs =>
+      Source
+        .fromIterator(() => bs.iterator)
+        .runWith(
+          FileIO
+            .toPath(Paths.get(s"${fileName}_${Instant.now().toString()}.csv"))
+        )
+    }
+
   def main(args: Array[String]): Unit = {
     ActorSystem(S3Uploader2(), "s3UploadDemo")
   }
 
-  def apply(): Behavior[NotUsed] =
+  def apply(): Behavior[Ack.type] =
     Behaviors.setup { context =>
       implicit val classicSystem = context.system.toClassic
       implicit val mat = ActorMaterializer()
@@ -130,34 +151,46 @@ object S3Uploader2 {
           overflowStrategy = OverflowStrategy.dropHead
         )
 
-      val (actorRef, source) = actorSource.preMaterialize()
-
-      val range = for (i <- 1 to 10) yield i
-      val messages = range.map(i => Record(i))
-
-      for (i <- 1 to 10) {
-        actorRef ! Record(i)
-      }
+      val actorSource2: Source[Protocol, ActorRef[Protocol]] =
+        ActorSource.actorRefWithBackpressure[Protocol, Ack.type](
+          ackTo = context.self,
+          ackMessage = Ack,
+          completionMatcher = {
+            case Complete => CompletionStrategy.draining
+          },
+          failureMatcher = {
+            case Fail(ex) => ex
+          }
+        )
 
       // Nr of records to group in each file
-      val n = 3
+      val n = 50
 
-      actorRef ! Complete
-
-      val stream =
-        source
+      val streamSource: ActorRef[Protocol] =
+        actorSource2
           .via(flow)
           .grouped(n)
           .via(s3MultiFlow(s3Config))
+          //.via(fileFlow("testfile"))
           .to(Sink.foreach(println))
+          .run()
 
-      stream.run()
+      streamSource ! Start
 
-      Behaviors.receiveSignal {
-        case (_, Terminated(_)) =>
-          Behaviors.stopped
-      }
+      sender(streamSource, 0)
 
     }
+
+  def sender(
+      streamSource: ActorRef[Protocol],
+      counter: Int
+  ): Behaviors.Receive[Ack.type] = Behaviors.receiveMessage {
+    case Ack if counter < 300 =>
+      streamSource ! Record(counter)
+      sender(streamSource, counter + 1)
+    case _ =>
+      streamSource ! Complete
+      Behaviors.same
+  }
 
 }
